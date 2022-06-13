@@ -1,0 +1,274 @@
+#!/usr/bin/python3
+
+import hashlib as hashlib
+import operator as operator
+import sys as sys
+from multiprocessing import Process, Queue
+
+# Default line-hash algorithm
+defaultHash = hashlib.sha1() # Everyone else copies this one.
+
+def debugPrint(someString):
+    None
+    # print(someString)
+
+
+def overflowsum(a, b, overflowValue):
+    # Add a and b such that overflow is added back in.
+    # Intended as a commutative operation with bounded data size as contrasted
+    # with Python's builtin arbitrary precision (but also commutative) add()
+    # function that is unbounded data size and hard to submit to hashing in a
+    # easily describable way.
+    flowing = operator.add(a,b)
+    over = flowing // overflowValue # See what data we would otherwise discard
+    if over > 0:
+        # Recurse rather than loop
+        return overflowsum(flowing % overflowValue, over, overflowValue) # keep within representable sized math
+    else:
+        return flowing
+
+
+def checksummer(lines):
+
+    ### Checksummer; blocks waiting for new work on the queue.
+
+    for line in lines:
+        digest = sumline(line)
+        # sumQueue.put(hashlib.sha1(thisline).digest())
+
+    # Put back the None that we got so the next checksummer knows to quit.
+    return digest
+
+
+def sumfile(fileToSum):
+
+    # The maximum size of the internal batches of data, intended
+    # to limit cost of using a Queue.
+    # NOTE: testing shows performance improvement drops off between 10k and 1k.
+    iqueueMax = 10000
+
+    ### PATTERN
+    # 1) How do we know when there is no more data coming in? (e.g. None)
+    # 2) How do we make sure our co-processors don't lose track of that?
+    # 3) 
+    # Start by pulling in data (possibly from another queue) and process it.
+    # 
+    # Default pattern: Data comes in from a queue, and we are not the only 
+    # reader.  We pull a None, we put a None back.
+    # 
+    # When we end the thread, do we put a None on the queue we are sending to?
+
+    # scarf up the data in the source file and enqueue it
+    def fileconsumer(fileToConsume,queue):
+        iqueue = []
+        ### File reader; Blocks waiting for queue to empty.
+        for line in fileToConsume:
+            # debugPrint("input: "+str(queue.qsize()))
+            iqueue.append(line)
+            if len(iqueue) > iqueueMax:
+                queue.put(iqueue)
+                iqueue = []
+
+        if len(iqueue) > 0:
+            queue.put(iqueue)
+        queue.put(None)
+        return
+
+    # For enqueued lines, checksum them and enqueue the checksum.
+    def sumline(lineQueue,hashQueue):
+        iqueue = []
+        # debugPrint("input: "+str(lineQueue.qsize())+" + checksum: "+str(hashQueue.qsize()))
+        nextLines = lineQueue.get()
+        while nextLines is not None:
+
+            for nextLine in nextLines:
+                thisline = defaultHash.copy()
+                thisline.update(nextLine.encode())
+                # Put the digest in the format requested by hashQueue.
+                iqueue.append((thisline.digest(), thisline.digest() ))
+                # debugPrint("input: "+str(lineQueue.qsize())+" + checksum: "+str(hashQueue.qsize()))
+            hashQueue.put(iqueue)
+            debugPrint("checksum batch enqueued, len=%d"%(hashQueue.qsize()))
+            iqueue = []
+            nextLines = lineQueue.get()
+
+        lineQueue.put(None) # Pass the fact the queue is empty to other processes.
+        hashQueue.put(None)
+        debugPrint("checksummer done, OUT! len=%d"%(hashQueue.qsize()))
+        return
+
+    # For enqueued checksums, combine them.  When triggered, put them on the
+    # queue of checksums.
+    def hashconsumer(hashQueue, drain=False):
+        iqueue = []
+
+        # Note that we are accepting the cost of adding one additional
+        # operation of xor and sum for each hashconsumer process for the
+        # simplicity benefits of the code.
+
+        # Initial state for the checksum of the file.
+        hashxor = b"\0" * defaultHash.digest_size
+        hashsum = b"\0" * defaultHash.digest_size
+        digest = (hashxor, hashsum)
+
+        digests=[]
+
+        # We loop through until either we get a hint that the queue might be
+        # empty soon (digest is None), or until we know it is empty because
+        # we were warned (we should be the only process in that second case).
+        # while ((drain and not hashQueue.empty()) or (digests is not None)):
+        while not hashQueue.empty() or digests is not None: 
+        
+            # The digest comes to us in two separate components: the current
+            # xor result, and the current sum result.  Because the xor against
+            # zero, and the sum with zero are both the original value, this
+            # means the first generation value is: (digest, digest), which
+            # is the output of the sumline function / process.
+
+            if digests is not None:
+                # if we are draining the queue, we simply skip the None values.
+
+                for digest in digests:
+                    # Combine the line hashes in two distinct commutative ways
+                    # Using xor eliminates the risk of one pair of additive inverses 
+                    # cancelling each other out.
+                    # debugPrint("digest: " + str(digest))
+                    # debugPrint("digest[0]: " + ":".join([str( value) for value in digest[0]]))
+                    # debugPrint("digest[1]: " + ":".join([str( value) for value in digest[1]]))
+                    # debugPrint("hashxor: " + ":".join([str( value) for value in hashxor]))
+                    # debugPrint("hashsum: " + ":".join([str( value) for value in hashsum]))
+                    hashxor = bytes(map(operator.xor, hashxor, digest[0]))
+
+                    # Summing the hashes eliminates the risk of failing to detect multiple
+                    # copies of the same line
+                    hashsum = bytes(map(lambda a, b:overflowsum(a, b, 256), hashsum, digest[1]))
+
+            # Avoid the special case where the last value in the queue is None
+            # which would otherwise lead us to endlessly wait on an empty queue
+            if not hashQueue.empty():
+                # Note that if someone else takes the last item in the queue as
+                # I was waiting for it, I can expect two more puts to the queue
+                # as they finish up.
+                digests = hashQueue.get()
+                # debugPrint("processed hash batch, queue size=%d"(hashQueue.qsize()))
+            else:
+                hashQueue.put([(hashxor, hashsum),])
+                debugPrint("combined hashes enqueued")
+                return
+
+
+            # debugPrint("Next queue value: " + str(digest))
+            # debugPrint("Drain: " + str(drain))
+            # debugPrint("HashQueue size: " + str(hashQueue.qsize()))
+            # debugPrint("HashQueue.empty(): " + str(hashQueue.empty()))
+
+        hashQueue.put([(hashxor, hashsum),])
+        # Prevents accidentally turning all None values into 0 values.  Is this
+        # a real problem?  Doesn't seem to be ... yet? TODO FIXME XXX
+        hashQueue.put(None)
+        debugPrint("final combined hashes enqueued")
+
+
+
+    maxQueueSize  = 1000
+    maxWorkers = 16
+
+    inputQueue = Queue(maxsize=maxQueueSize)
+    checksumQueue = Queue(maxsize=maxQueueSize)
+    
+    # Start one of each process (minimum required)
+    grabLines = Process(target=fileconsumer, name="input0", args=(fileToSum, inputQueue,))
+    grabLines.start()
+    
+    checksumLines=[]
+    checksumLines.append(Process(target=sumline, name="hash0", args=(inputQueue,checksumQueue,)))
+    checksumLines[-1].start()
+
+    hashCombiners=[]
+    hashCombiners.append(Process(target=hashconsumer, name="agg0", args=(checksumQueue,)))
+    hashCombiners[-1].start()
+
+    # Need some trigger for "are we there yet?"
+    # Check for queue size ~ to len(checksumLines) in inputQueue, and queue
+    # size ~ to len(hashCombiners) in checksumQueue?  Join all of the sub-
+    # processes?  Both?
+    
+    # Plan: Watch carefully until we max out our processes, then wait for
+    # them to finish.  This is a busy wait to start with, then v. calm.
+    while True:
+        debugPrint(
+                "gl: " + str(grabLines.is_alive()) +
+                "\tcsum workers: %d\t hash workers: %d" % (len(checksumLines), len(hashCombiners)) +
+                "\tlines Q: %d\t sum Q: %d"%(inputQueue.qsize(), checksumQueue.qsize()))
+        if not grabLines.is_alive():
+            # At least one process is done, time to finish up
+            debugPrint("almost done")
+            break
+        if len(checksumLines) >= maxWorkers and len(hashCombiners) >= maxWorkers: 
+            # We can't add any workers; just wait for it all to be over.
+            debugPrint("maxwork")
+            break
+        if len(checksumLines) < maxWorkers: # We can add workers,
+            if (inputQueue.qsize() > ( 2 * len(checksumLines) )): # and we should.
+                debugPrint("queue: %d, # workers: %d" % (inputQueue.qsize(), len(checksumLines)) )
+                debugPrint("adding summer")
+                checksumLines.append(Process(target=sumline, name="hash"+str(len(checksumLines)+1), args=(inputQueue,checksumQueue,)))
+                checksumLines[-1].start()
+        if len(hashCombiners) < maxWorkers:  # We can add workers
+            if (checksumQueue.qsize() > ( 2 * len(hashCombiners) )): # and we should
+                debugPrint("queue: %d, # workers: %d" % (checksumQueue.qsize(), len(hashCombiners)) )
+                debugPrint("adding combiner")
+                hashCombiners.append(Process(target=hashconsumer, name="agg"+str(len(hashCombiners)+1), args=(checksumQueue,)))
+                hashCombiners[-1].start()
+
+    debugPrint(
+            "gl: " + str(grabLines.is_alive()) +
+            "\tcsum workers: %d\t hash workers: %d" % (len(checksumLines), len(hashCombiners)) +
+            "\tlines Q: %d\t sum Q: %d"%(inputQueue.qsize(), checksumQueue.qsize()))
+
+    # I'll try the 'join-em-all-let-god-sort-it-out' approach:
+    debugPrint("Waiting for child processes to finish...")
+    for proc in [grabLines,] + checksumLines + hashCombiners:
+        debugPrint("Joining: "+ str(proc.name) + "\tpid: " + str(proc.pid))
+        proc.join() # This can deadlock if it left an item on the queue, and no-one picks it up!
+        debugPrint("Joined")
+
+    debugPrint("Childeren finished, draining.")
+    # Then, combine the last batch of hashes:
+    hashconsumer(checksumQueue, drain=True)
+
+    # And then take the last hash and return the data.
+    (hashxor, hashsum) = checksumQueue.get()[0]
+    filehash = defaultHash.copy()
+    filehash.update(hashxor)
+    filehash.update(hashsum)
+    # Debug:
+    debugPrint("Input queue size: " + str(inputQueue.qsize()) + 
+            "\nHash queue size: " + str(checksumQueue.qsize()))
+    return filehash.hexdigest()
+
+
+
+def printsum(checksum, filename=None):
+
+    if filename is not None:
+        print(checksum + "\t" + filename)
+    else:
+        print(checksum)
+
+
+if __name__ == "__main__":
+
+    # Overall cost: N + 1 checksums for N lines, plus
+    # N - 1 xors for N lines, plus N - 1 adds for N lines.
+
+    stdin = None # Signal to checksum to use sys.stdin for data.       
+    if len(sys.argv) > 1:
+        # There are commandline arguments, open then one-by-one and send them
+        # through sumfile.
+        for arg in sys.argv[1:]:
+            printsum(sumfile(open(arg,"r")),filename=arg)
+
+    else:
+        printsum(sumfile(sys.stdin),filename=stdin)
+

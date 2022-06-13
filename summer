@@ -1,0 +1,89 @@
+#!/usr/bin/python3
+
+import hashlib as hashlib
+import operator as operator
+import sys as sys
+import base64 as base64
+
+# Default line-hash algorithm
+
+
+def overflowsum(a, b, overflowValue):
+    # Add a and b such that overflow is added back in.
+    # Intended as a commutative operation with bounded data size as contrasted
+    # with Python's builtin arbitrary precision (but also commutative) add()
+    # function that is unbounded data size and hard to submit to hashing in a
+    # easily describable way.
+    flowing = operator.add(a,b)
+    over = flowing // overflowValue # See what data we would otherwise discard
+    if over > 0:
+        # Recurse rather than loop
+        return overflowsum(flowing % overflowValue, over, overflowValue) # keep within representable sized math
+    else:
+        return flowing
+
+    # Old code with loop and state instead of recursion.
+'''
+    flowing = flowing % overflowValue
+    while over > 0:
+        # print("Flowing: "+str(flowing)+"\nOver: "+str(over))
+        flowing = operator.add(flowing, over)
+        over = flowing // overflowValue # See what data we would otherwise discard
+        flowing = flowing % overflowValue # keep within representable sized math
+
+    return flowing
+'''
+
+def sumfile(fileToSum, removeDupes=False):
+
+    linehash = hashlib.sha1()
+
+    # State for the checksum of the file.
+    hashxor = b"\0" * linehash.digest_size
+    hashsum = b"\0" * linehash.digest_size
+    
+    if removeDupes:
+        # For many short lines, amount of memory used will be larger than the file
+        # size.  Bloom filter to keep memory usage down for the worst case?
+        # It would be better to use an alternative commutative function for
+        # combining hashes?
+        seenhashes = {} 
+
+
+    for line in fileToSum:
+        # Is this faster, or creating a new hash with the original call?
+        # Note that this simplifies the code if a new hash is selected.
+        thisline = linehash.copy()
+        thisline.update(line.encode())
+        digest = thisline.digest()
+
+        if removeDupes:
+            if digest in seenhashes:
+                continue # Ignore duplicate lines.... or lines with collisions?
+            seenhashes[digest]=None
+        
+        # Combine the line hashes in two distinct commutative ways
+        hashxor = bytes(map(operator.xor, hashxor, digest))
+        # Summing the hashes eliminates the risk of failing to detect multiple
+        # copies of the same line
+        hashsum = bytes(map(lambda a, b:overflowsum(a, b, 256), hashsum, digest))
+
+    filehash = linehash.copy()
+    filehash.update(hashxor)
+    filehash.update(hashsum)
+    return filehash.hexdigest()
+
+def printsum(checksum, filename=None):
+    if filename is not None:
+        print(checksum + "\t" + filename)
+    else:
+        print(checksum)
+
+if len(sys.argv) > 1:
+    # There are commandline arguments, open then one-by-one and send them
+    # through sumfile.
+    for arg in sys.argv[1:]:
+        printsum(sumfile(open(arg,"r")),filename=arg)
+
+else:
+    printsum(sumfile(sys.stdin))
