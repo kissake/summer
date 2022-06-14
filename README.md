@@ -21,11 +21,10 @@ might produce lines in different orders, but still describe the same graph.
 
 For context, the files being big enough you don't want to sort implies that the 
 files are significantly larger than RAM, as unix 'sort' is wicked fast, and faster 
-than this program for large files, hands down.  The reason is that our hash 
-algorithm has significant setup and output costs, and these overwhelm the memory 
-benefits by multiples.  Put another way: probably only look to this tool for files 
-100s of gigabytes or larger, where our O(n) algorithm can start to compete with 
-sort's O(n log n) algorithm.
+than this program for large files, hands down.  I believe the reason is that our hash 
+function has significant costs, and these overwhelm the memory benefits by multiples.  
+Put another way: probably only look to this tool for files 100s of gigabytes or 
+larger, where our O(n) algorithm can start to compete with sort's O(n log n) algorithm.
 
 The cryptographic hash function that performs best (so far) is sha1.  Security is discussed
 in another section below.
